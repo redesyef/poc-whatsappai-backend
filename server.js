@@ -3,10 +3,11 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const cors = require('cors');
 const OpenAI = require('openai');
-
+const { Server } = require('socket.io');
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
-
+const http = require('http');
+const { createServer } = require('node:http');
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
@@ -14,6 +15,16 @@ const supabase = createClient(
 
 const app = express();
 const port = 3000;
+//const server = http.createServer(app);
+const server = createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: '*', // Cambia '*' por el origen correcto si no es abierto
+    methods: ['GET', 'POST'],
+    credentials: true,
+  },
+});
 
 app.use(cors());
 app.use(express.json()); // Para parsear el JSON en las solicitudes
@@ -25,7 +36,22 @@ let isAuthenticated = false;
 const client = new Client({
   authStrategy: new LocalAuth(),
 });
+io.on('connection', (socket) => {
+  console.log('Cliente conectado:', socket.id);
+  socket.emit('message', 'Bienvenido al servidor WebSocket!');
+  // Envía el código QR al cliente si está disponible
+  if (qrCode) {
+    socket.emit('qr', { qrCode });
+  }
 
+  // Envía el estado de autenticación al conectar
+  socket.emit('authenticated', isAuthenticated);
+
+  // Desconexión del cliente
+  socket.on('disconnect', () => {
+    console.log('Cliente desconectado:', socket.id);
+  });
+});
 // Inicializa OpenAI usando la variable de entorno
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -56,6 +82,7 @@ client.on('qr', (qr) => {
       console.error('Error al generar el código QR:', err);
     } else {
       qrCode = url;
+      io.emit('qr', { qrCode });
     }
   });
 });
@@ -65,12 +92,14 @@ client.on('authenticated', () => {
   console.log('Autenticación exitosa');
   qrCode = null;
   isAuthenticated = true;
+  io.emit('authenticated', true);
 });
 
 // Evento para manejar la autenticación fallida
 client.on('auth_failure', () => {
   console.log('Error de autenticación');
   isAuthenticated = false;
+  io.emit('authenticated', false);
 });
 
 // Inicializa el cliente de WhatsApp
@@ -79,12 +108,36 @@ client.initialize();
 // Endpoint para devolver el QR
 app.get('/qr', (req, res) => {
   if (qrCode) {
-    res.json({ qrCode });
+    res.json({ qrCode, isAuthenticated });
+    io.emit('authenticated', true);
+  }
+  if (isAuthenticated) {
+    res.json({ isAuthenticated });
   } else {
     res.status(404).json({ message: 'QR no disponible o ya autenticado' });
   }
 });
+app.post('/logout', async (req, res) => {
+  if (!isAuthenticated) {
+    return res.status(400).json({ message: 'No hay una sesión activa.' });
+  }
 
+  try {
+    await client.logout(); // Cerrar sesión
+    isAuthenticated = false; // Actualizar el estado de autenticación
+    qrCode = null; // Reiniciar el código QR
+    io.emit('authenticated', false);
+    // Reiniciar el cliente para que esté listo para una nueva autenticación
+    client.initialize();
+
+    res.json({ message: 'Sesión cerrada exitosamente. Cliente reiniciado.' });
+  } catch (error) {
+    console.error('Error al cerrar la sesión:', error);
+    res
+      .status(500)
+      .json({ message: 'Error al cerrar la sesión.', error: error.message });
+  }
+});
 // Endpoint para verificar si el cliente está autenticado
 app.get('/status', (req, res) => {
   res.json({ authenticated: isAuthenticated });
@@ -198,13 +251,19 @@ app.get('/chat-stats/:chatId', async (req, res) => {
 
     const embeddings = data.map((row) => row.embedding);
     const chatContent = data.map((row) => row.content).join(' ');
-    // Concatenar embeddings en un formato adecuado para la API de OpenAI
-    const concatenatedEmbeddings = embeddings.join(' ');
-    const context = `Los siguientes embeddings fueron generados a partir de un chat de WhatsApp. Los números representan la comprensión del contenido del chat. Aquí están los embeddings: ${JSON.stringify(
+
+    const context = `Los siguientes embeddings fueron generados a partir de un chat de WhatsApp. Estos números representan la comprensión del contenido del chat. A continuación, te proporciono los embeddings:: ${JSON.stringify(
       embeddings
-    )}, quiero que me digas es el tema de conversación principal, pudes ver la conversión original aquí: ${JSON.stringify(
+    )},Y aquí está la conversación original::${JSON.stringify(
       chatContent
-    )} dilo en sólo una frase y crea un cuadro con la información más relevante, cmo contando palabras repetidas, número de la persona que más participa y más estadísticas `;
+    )} Por favor, analiza la información de la conversación y proporciona un análisis detallado creando un array de objetos que contenga título y descripción(nop incluyas testos exta al array de objetos),debes incluir, pero no limitarte a, lo siguiente:
+
+Tema de conversación principal: Identifica el tema más relevante discutido en el chat.
+Horarios picos: Determina las horas con la mayor cantidad de mensajes enviados y recibidos.
+Tendencias de comunicación: Señala patrones importantes en la comunicación, como cambios en el tono o la emoción.
+Participación: Indica quiénes son los participantes más activos en la conversación.
+Sentimiento general: Analiza el sentimiento general de la conversación (positivo, negativo, neutral).
+Entregame el análisis en formato JSON siempre entregando directamente el array con el objeto {'descripcion', 'titulo'} estructurado, fácil de interpretar y con valores cuantitativos importantes. `;
     // Usar OpenAI para analizar el contenido y generar estadísticas
     const analysisResponse = await openai.chat.completions.create({
       model: 'gpt-4o-mini', // Puedes usar el modelo más adecuado
@@ -235,6 +294,6 @@ app.get('/chat-stats/:chatId', async (req, res) => {
 });
 
 // Inicia el servidor
-app.listen(port, () => {
+server.listen(port, () => {
   console.log(`Servidor corriendo en http://localhost:${port}`);
 });
